@@ -15,49 +15,28 @@ export function useVoiceAgent() {
 
   const roomRef = useRef(null);
   const wsRef = useRef(null);
-  const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
   const reconnectAttemptsRef = useRef(0);
-  const audioContextRef = useRef(null);
-  const audioQueueRef = useRef([]);
-  const playbackSourceRef = useRef(null);
+  const captureAudioContextRef = useRef(null);
+  const captureWorkletNodeRef = useRef(null);
 
   useEffect(() => () => stopSession(), []);
 
-  const enqueueAudio = async (base64Chunk) => {
-    const binary = Uint8Array.from(atob(base64Chunk), (char) => char.charCodeAt(0));
-    const ctx = audioContextRef.current || new AudioContext();
-    audioContextRef.current = ctx;
+  // 🔊 SIMPLE AUDIO PLAYBACK (FIXED)
+  const playAudio = async (base64Chunk) => {
+    try {
+      const audio = new Audio(`data:audio/mp3;base64,${base64Chunk}`);
+      setIsAssistantSpeaking(true);
 
-    const buffer = await ctx.decodeAudioData(binary.buffer.slice(0));
-    audioQueueRef.current.push(buffer);
-    if (!playbackSourceRef.current) playNextAudioBuffer();
-  };
+      audio.onended = () => {
+        setIsAssistantSpeaking(false);
+      };
 
-  const playNextAudioBuffer = () => {
-    const ctx = audioContextRef.current;
-    const nextBuffer = audioQueueRef.current.shift();
-
-    if (!ctx || !nextBuffer) {
-      playbackSourceRef.current = null;
+      await audio.play();
+    } catch (err) {
+      console.log("Autoplay blocked:", err);
       setIsAssistantSpeaking(false);
-      return;
     }
-
-    const source = ctx.createBufferSource();
-    source.buffer = nextBuffer;
-    source.connect(ctx.destination);
-    source.onended = playNextAudioBuffer;
-    source.start();
-    playbackSourceRef.current = source;
-    setIsAssistantSpeaking(true);
-  };
-
-  const clearAudioPlayback = () => {
-    audioQueueRef.current = [];
-    if (playbackSourceRef.current) playbackSourceRef.current.stop();
-    playbackSourceRef.current = null;
-    setIsAssistantSpeaking(false);
   };
 
   const connectWebSocket = () => {
@@ -65,39 +44,104 @@ export function useVoiceAgent() {
     ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
 
-    ws.onopen = () => {
+    ws.onopen = async () => {
       reconnectAttemptsRef.current = 0;
       ws.send(JSON.stringify({ type: 'session.start' }));
 
-      const recorder = new MediaRecorder(streamRef.current, {
-        mimeType: 'audio/webm;codecs=opus',
-        audioBitsPerSecond: 32000
-      });
-      mediaRecorderRef.current = recorder;
+      const audioContext = new AudioContext({ sampleRate: 48000 });
+      captureAudioContextRef.current = audioContext;
 
-      recorder.ondataavailable = async (event) => {
-        if (event.data.size === 0 || ws.readyState !== WebSocket.OPEN) return;
-        const arrayBuffer = await event.data.arrayBuffer();
-        ws.send(arrayBuffer);
+      console.log("Actual sample rate:", audioContext.sampleRate);
+
+      // 🔥 AudioWorklet (STT pipeline)
+      const workletCode = `
+        class PcmTapProcessor extends AudioWorkletProcessor {
+          process(inputs) {
+            const input = inputs[0] && inputs[0][0];
+            if (input && input.length) {
+              const copy = new Float32Array(input.length);
+              copy.set(input);
+              this.port.postMessage(copy, [copy.buffer]);
+            }
+            return true;
+          }
+        }
+        registerProcessor('pcm-tap', PcmTapProcessor);
+      `;
+
+      const blobUrl = URL.createObjectURL(new Blob([workletCode], { type: 'application/javascript' }));
+      await audioContext.audioWorklet.addModule(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+
+      const source = audioContext.createMediaStreamSource(streamRef.current);
+      const workletNode = new AudioWorkletNode(audioContext, 'pcm-tap', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        channelCount: 1
+      });
+
+      captureWorkletNodeRef.current = workletNode;
+
+      workletNode.port.onmessage = (event) => {
+        const input = event.data instanceof Float32Array ? event.data : new Float32Array(event.data);
+
+        const buffer = new ArrayBuffer(input.length * 2);
+        const view = new DataView(buffer);
+
+        for (let i = 0; i < input.length; i++) {
+          const s = Math.max(-1, Math.min(1, input[i]));
+          view.setInt16(i * 2, s * 0x7fff, true);
+        }
+
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(buffer); // ✅ PCM to backend
+        }
       };
 
-      recorder.start(200);
+      const sink = audioContext.createGain();
+      sink.gain.value = 0;
+
+      source.connect(workletNode);
+      workletNode.connect(sink);
+      sink.connect(audioContext.destination);
+
       setIsListening(true);
     };
 
     ws.onmessage = async (event) => {
       const payload = JSON.parse(event.data);
-      if (payload.type === 'stt.partial') setPartialTranscript(payload.text);
+
+      if (payload.type === 'stt.partial') {
+        setPartialTranscript(payload.text);
+      }
+
       if (payload.type === 'stt.final') {
         setPartialTranscript('');
-        setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: 'user', text: payload.text }]);
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: 'user', text: payload.text }
+        ]);
       }
+
       if (payload.type === 'assistant.text') {
-        setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: 'assistant', text: payload.text }]);
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: 'assistant', text: payload.text }
+        ]);
       }
-      if (payload.type === 'assistant.audio.chunk') await enqueueAudio(payload.audioBase64);
-      if (payload.type === 'metrics.latency') setLatency(payload.ms);
-      if (payload.type === 'error') setError(payload.message);
+
+      // 🔥 FIXED AUDIO HANDLER
+      if (payload.type === 'assistant.audio') {
+        await playAudio(payload.audio);
+      }
+
+      if (payload.type === 'metrics.latency') {
+        setLatency(payload.ms);
+      }
+
+      if (payload.type === 'error') {
+        setError(payload.message);
+      }
     };
 
     ws.onclose = () => {
@@ -119,6 +163,7 @@ export function useVoiceAgent() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ identity: `user-${crypto.randomUUID()}` })
       });
+
       if (!tokenRes.ok) throw new Error('Failed to fetch LiveKit token');
 
       const { token, url } = await tokenRes.json();
@@ -133,6 +178,7 @@ export function useVoiceAgent() {
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
+
       const [audioTrack] = stream.getAudioTracks();
       await room.localParticipant.publishTrack(audioTrack);
 
@@ -145,26 +191,37 @@ export function useVoiceAgent() {
   };
 
   const stopSession = () => {
-    clearAudioPlayback();
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop();
-    if (streamRef.current) streamRef.current.getTracks().forEach((track) => track.stop());
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+    }
 
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'stt.flush' }));
       wsRef.current.send(JSON.stringify({ type: 'session.stop' }));
       wsRef.current.close();
     }
 
+    if (captureWorkletNodeRef.current) {
+      captureWorkletNodeRef.current.disconnect();
+      captureWorkletNodeRef.current = null;
+    }
+
+    if (captureAudioContextRef.current) {
+      captureAudioContextRef.current.close();
+      captureAudioContextRef.current = null;
+    }
+
     roomRef.current?.disconnect();
+
     setIsListening(false);
     setConnectionState('disconnected');
+    setIsAssistantSpeaking(false);
   };
 
   const interruptAssistant = () => {
-    clearAudioPlayback();
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'assistant.interrupt' }));
     }
+    setIsAssistantSpeaking(false);
   };
 
   return {

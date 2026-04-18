@@ -4,7 +4,7 @@ import { Router } from 'express';
 export function livekitRouter({ config }) {
   const router = Router();
 
-  router.post('/token', (req, res) => {
+  router.post('/token', async (req, res) => {
     const { identity } = req.body;
 
     if (!identity) {
@@ -19,7 +19,9 @@ export function livekitRouter({ config }) {
       canSubscribe: true
     });
 
-    return res.json({ token: token.toJwt(), url: config.livekit.url });
+    const jwt = await token.toJwt();
+
+    return res.json({ token: jwt, url: config.livekit.url });
   });
 
   return router;

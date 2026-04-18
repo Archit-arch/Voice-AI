@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 export const config = {
-  port: Number(process.env.PORT || 8080),
+  port: Number(process.env.PORT || 8081),
   livekit: {
     url: process.env.LIVEKIT_URL,
     apiKey: process.env.LIVEKIT_API_KEY,
@@ -11,7 +11,7 @@ export const config = {
     roomName: process.env.LIVEKIT_ROOM || 'voice-ai-room'
   },
   openai: {
-    apiKey: process.env.OPENAI_API_KEY
+    apiKey: process.env.OPENROUTER_API_KEY
   },
   deepgram: {
     apiKey: process.env.DEEPGRAM_API_KEY

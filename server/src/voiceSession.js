@@ -1,8 +1,8 @@
 import { v4 as uuidv4 } from 'uuid';
-import { STTService } from '../../services/sttService.js';
-import { LLMService } from '../../services/llmService.js';
-import { TTSService } from '../../services/ttsService.js';
-import { WhisperFallbackService } from '../../services/whisperFallbackService.js';
+import { STTService } from '../services/sttService.js';
+import { LLMService } from '../services/llmService.js';
+import { TTSService } from '../services/ttsService.js';
+import { WhisperFallbackService } from '../services/whisperFallbackService.js';
 import { EvalLogger } from '../../evals/evalLogger.js';
 
 export function wireVoiceSocket({ wsServer, config, logger }) {
@@ -13,6 +13,7 @@ export function wireVoiceSocket({ wsServer, config, logger }) {
 
   wsServer.on('connection', (socket) => {
     const sessionId = uuidv4();
+
     const conversation = [
       {
         role: 'system',
@@ -27,20 +28,27 @@ export function wireVoiceSocket({ wsServer, config, logger }) {
     let turnStart = 0;
 
     const send = (payload) => {
-      if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(payload));
+      if (socket.readyState === socket.OPEN) {
+        socket.send(JSON.stringify(payload));
+      }
     };
 
+    // 🔥 MAIN ASSISTANT PIPELINE
     const runAssistantTurn = async (userText) => {
       if (!userText?.trim()) return;
 
       turnStart = Date.now();
       conversation.push({ role: 'user', content: userText });
+
       send({ type: 'stt.final', text: userText });
 
+      // ✅ ALWAYS initialize controller
       activeAbortController = new AbortController();
+
       let streamedText = '';
 
       try {
+        // 🔹 LLM STREAM
         await llm.streamReply({
           conversation,
           signal: activeAbortController.signal,
@@ -52,16 +60,28 @@ export function wireVoiceSocket({ wsServer, config, logger }) {
         if (activeAbortController.signal.aborted) return;
 
         const assistantText = streamedText.trim();
+
         conversation.push({ role: 'assistant', content: assistantText });
+
         send({ type: 'assistant.text', text: assistantText });
 
-        await tts.streamSpeech({
+        console.log("🎯 CALLING TTS");
+
+        // 🔹 TTS (buffered MP3; sent as one payload)
+        const audioBase64 = await tts.streamSpeech({
           text: assistantText,
-          signal: activeAbortController.signal,
-          onChunk: (audioBase64) => send({ type: 'assistant.audio.chunk', audioBase64 })
+          signal: activeAbortController.signal // ✅ SAFE NOW
         });
 
+        if (!activeAbortController.signal.aborted && audioBase64) {
+          send({
+            type: 'assistant.audio', // ✅ matches frontend
+            audio: audioBase64
+          });
+        }
+
         const latency = Date.now() - turnStart;
+
         send({ type: 'metrics.latency', ms: latency });
 
         evalLogger.log({
@@ -71,9 +91,17 @@ export function wireVoiceSocket({ wsServer, config, logger }) {
           relevanceScore: evalLogger.scoreRelevance({ userText, assistantText }),
           success: true
         });
+
       } catch (error) {
+        console.error("🔥 FULL ERROR:", error);
+
         logger.error({ error }, 'Voice turn failed');
-        send({ type: 'error', message: 'Assistant turn failed. Please retry.' });
+
+        send({
+          type: 'error',
+          message: error.message || 'Assistant turn failed'
+        });
+
         evalLogger.log({
           sessionId,
           turnLatencyMs: Date.now() - turnStart,
@@ -82,18 +110,23 @@ export function wireVoiceSocket({ wsServer, config, logger }) {
           success: false,
           error: error.message
         });
+
       } finally {
+        // ✅ cleanup
         activeAbortController = null;
       }
     };
 
+    // 🔥 SOCKET HANDLER
     socket.on('message', async (data, isBinary) => {
       try {
         if (isBinary) {
           if (sttConn) {
-            sttConn.send(Buffer.from(data));
+            console.log("AUDIO CHUNK SIZE:", data.length);
+            sttConn.send(data);
           } else if (whisperFallback) {
             whisperFallback.addAudioChunk(data);
+
             if (whisperFallback.shouldFlush()) {
               const partialText = await whisperFallback.flushToText();
               if (partialText) send({ type: 'stt.partial', text: partialText });
@@ -104,38 +137,59 @@ export function wireVoiceSocket({ wsServer, config, logger }) {
 
         const event = JSON.parse(data.toString());
 
+        // 🔹 START SESSION
         if (event.type === 'session.start') {
           if (config.deepgram.apiKey) {
             sttConn = stt.createStreamingSession({
               onPartial: (text) => send({ type: 'stt.partial', text }),
               onFinal: async (text) => runAssistantTurn(text),
-              onError: (err) => send({ type: 'error', message: `STT error: ${err.message}` })
+              onError: (err) =>
+                send({ type: 'error', message: `STT error: ${err.message}` })
             });
           } else {
-            whisperFallback = new WhisperFallbackService({ apiKey: config.openai.apiKey, logger });
-            send({ type: 'error', message: 'Deepgram key missing; using Whisper fallback with higher latency.' });
+            whisperFallback = new WhisperFallbackService({
+              apiKey: config.openai.apiKey,
+              logger
+            });
+
+            send({
+              type: 'error',
+              message:
+                'Deepgram key missing; using Whisper fallback with higher latency.'
+            });
           }
         }
 
-        if (event.type === 'assistant.interrupt' && activeAbortController) {
-          activeAbortController.abort();
+        // 🔹 INTERRUPT
+        if (event.type === 'assistant.interrupt') {
+          if (activeAbortController) {
+            activeAbortController.abort();
+          }
         }
 
+        // 🔹 WHISPER FLUSH
         if (event.type === 'stt.flush' && whisperFallback) {
           const finalText = await whisperFallback.flushToText();
           await runAssistantTurn(finalText);
         }
 
+        // 🔹 STOP SESSION
         if (event.type === 'session.stop') {
           if (sttConn) sttConn.finish();
           socket.close();
         }
+
       } catch (error) {
         logger.error({ error }, 'Socket message handling error');
-        send({ type: 'error', message: 'Malformed payload' });
+
+        send({
+          type: 'error',
+          message: 'Malformed payload'
+        });
       }
     });
 
+    // 🔥 CLEANUP
     socket.on('close', () => {
       if (sttConn) sttConn.finish();
       if (activeAbortController) activeAbortController.abort();
