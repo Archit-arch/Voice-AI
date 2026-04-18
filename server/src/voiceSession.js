@@ -1,8 +1,8 @@
 import { v4 as uuidv4 } from 'uuid';
-import { STTService } from '../services/sttService.js';
-import { LLMService } from '../services/llmService.js';
-import { TTSService } from '../services/ttsService.js';
-import { WhisperFallbackService } from '../services/whisperFallbackService.js';
+import { STTService } from '../../services/sttService.js';
+import { LLMService } from '../../services/llmService.js';
+import { TTSService } from '../../services/ttsService.js';
+import { WhisperFallbackService } from '../../services/whisperFallbackService.js';
 import { EvalLogger } from '../../evals/evalLogger.js';
 
 export function wireVoiceSocket({ wsServer, config, logger }) {

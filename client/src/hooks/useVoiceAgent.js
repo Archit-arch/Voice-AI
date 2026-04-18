@@ -18,14 +18,11 @@ export function useVoiceAgent() {
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
   const reconnectAttemptsRef = useRef(0);
-  const shouldReconnectRef = useRef(false);
   const audioContextRef = useRef(null);
   const audioQueueRef = useRef([]);
   const playbackSourceRef = useRef(null);
 
-  useEffect(() => {
-    return () => stopSession();
-  }, []);
+  useEffect(() => () => stopSession(), []);
 
   const enqueueAudio = async (base64Chunk) => {
     const binary = Uint8Array.from(atob(base64Chunk), (char) => char.charCodeAt(0));
@@ -105,7 +102,7 @@ export function useVoiceAgent() {
 
     ws.onclose = () => {
       setIsListening(false);
-      if (shouldReconnectRef.current && reconnectAttemptsRef.current < 2) {
+      if (connectionState === 'connected' && reconnectAttemptsRef.current < 2) {
         reconnectAttemptsRef.current += 1;
         setTimeout(connectWebSocket, 500 * reconnectAttemptsRef.current);
       }
@@ -115,55 +112,40 @@ export function useVoiceAgent() {
   const startSession = async () => {
     try {
       setError('');
-      shouldReconnectRef.current = true;
       setConnectionState('connecting');
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
 
       const tokenRes = await fetch(`${API_BASE}/api/livekit/token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ identity: `user-${crypto.randomUUID()}` })
       });
+      if (!tokenRes.ok) throw new Error('Failed to fetch LiveKit token');
 
-      if (!tokenRes.ok) {
-        const payload = await tokenRes.json().catch(() => ({}));
-        throw new Error(payload.error || 'Failed to fetch LiveKit token');
-      }
+      const { token, url } = await tokenRes.json();
+      const room = new Room();
+      roomRef.current = room;
 
-      const tokenPayload = await tokenRes.json();
+      room.on(RoomEvent.ConnectionStateChanged, (state) => {
+        setConnectionState(state);
+      });
 
-      if (tokenPayload.enabled) {
-        const room = new Room();
-        roomRef.current = room;
+      await room.connect(url, token);
 
-        room.on(RoomEvent.ConnectionStateChanged, (state) => {
-          setConnectionState(state);
-        });
-
-        await room.connect(tokenPayload.url, tokenPayload.token);
-
-        const [audioTrack] = stream.getAudioTracks();
-        await room.localParticipant.publishTrack(audioTrack);
-      } else {
-        setConnectionState('connected');
-        setError(tokenPayload.reason || 'LiveKit disabled; using websocket-only mode.');
-      }
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      const [audioTrack] = stream.getAudioTracks();
+      await room.localParticipant.publishTrack(audioTrack);
 
       connectWebSocket();
       setConnectionState('connected');
     } catch (err) {
       setError(err.message);
       setConnectionState('disconnected');
-      shouldReconnectRef.current = false;
     }
   };
 
   const stopSession = () => {
-    shouldReconnectRef.current = false;
     clearAudioPlayback();
-
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop();
     if (streamRef.current) streamRef.current.getTracks().forEach((track) => track.stop());
 

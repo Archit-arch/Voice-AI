@@ -72,13 +72,13 @@ This project implements a low-latency voice assistant pipeline:
 │   │   ├── index.js
 │   │   ├── logger.js
 │   │   └── voiceSession.js
-│   ├── services/
-│   │   ├── llmService.js
-│   │   ├── sttService.js
-│   │   ├── ttsService.js
-│   │   └── whisperFallbackService.js
 │   ├── .env.example
 │   └── package.json
+├── services/
+│   ├── llmService.js
+│   ├── sttService.js
+│   ├── ttsService.js
+│   └── whisperFallbackService.js
 ├── evals/
 │   └── evalLogger.js
 └── README.md
@@ -169,14 +169,3 @@ Use this concise narrative:
 
 > “I built a real-time voice assistant with a streaming speech-to-speech pipeline. The browser publishes mic audio in real time, the backend transcribes with Deepgram (or Whisper fallback), generates contextual replies with GPT, and streams ElevenLabs audio back immediately. I designed it with modular services and interruption support, so users can barge in naturally. I also instrumented JSONL eval logs to track ASR quality placeholders, end-to-end latency, relevance scoring, and success rates. The architecture is production-oriented with clean boundaries, environment-based config, and reconnection/error handling.”
 
-
-
-## Troubleshooting `could not establish signal connection: Failed to fetch`
-
-If you see this error, one of the following is usually true:
-
-1. `LIVEKIT_URL` is missing/invalid (for example left as placeholder).
-2. LiveKit server is not reachable from your browser network.
-3. Backend is not running on `http://localhost:8080`.
-
-This project now supports websocket-only fallback if LiveKit credentials are not set. In that mode, voice pipeline still works, and the UI shows a warning instead of failing the entire session.

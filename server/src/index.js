@@ -17,7 +17,7 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.use('/api/livekit', livekitRouter({ config, logger }));
+app.use('/api/livekit', livekitRouter({ config }));
 
 const server = http.createServer(app);
 const wsServer = new WebSocketServer({ server, path: '/ws/voice' });
